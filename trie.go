@@ -6,71 +6,85 @@ import (
 	"math/bits"
 	"net/netip"
 	"strings"
-	"unsafe"
 )
 
-// Trie is a compressed IP radix trie implementation, similar to what is described at
+// Trie represents operations of a trie.
+type Trie[T any] interface {
+	fmt.Stringer
+
+	Insert(network netip.Prefix, value T) Trie[T]
+	Remove(network netip.Prefix) (T, bool)
+	Find(ip netip.Addr) (T, bool)
+	FindLargest(ip netip.Addr) (T, bool)
+	Contains(ip netip.Addr) bool
+	ContainingNetworks(ip netip.Addr) []netip.Prefix
+	CoveredNetworks(network netip.Prefix) []netip.Prefix
+	GetParent() Trie[T]
+	GetNetwork() netip.Prefix
+}
+
+// trie is the default implementation of Trie. It is a compressed
+// IP radix trie implementation, similar to what is described at
 // https://vincent.bernat.im/en/blog/2017-ipv4-route-lookup-linux
 //
-// Path compression merges nodes with only one child into their parent, decreasing the amount of traversals needed when
-// looking up a value.
-type Trie struct {
-	parent   *Trie
-	children [2]*Trie
+// Path compression merges nodes with only one child into their parent,
+// decreasing the amount of traversals needed when looking up a value.
+type trie[T any] struct {
+	parent   *trie[T]
+	children [2]*trie[T]
 
 	network netip.Prefix
-	value   any
+	value   *T
 }
 
 // NewTrie creates a new Trie.
-func NewTrie() *Trie {
-	return &Trie{
-		network: netip.PrefixFrom(netip.IPv6Unspecified(), 0),
-	}
+func NewTrie[T any]() Trie[T] {
+	return newSubTree[T](netip.PrefixFrom(netip.IPv6Unspecified(), 0), nil)
 }
 
-func newSubTree(network netip.Prefix, value any) *Trie {
-	return &Trie{
+func newSubTree[T any](network netip.Prefix, value *T) *trie[T] {
+	return &trie[T]{
 		network: network,
 		value:   value,
 	}
 }
 
 // Insert inserts an entry into the trie.
-func (pt *Trie) Insert(network netip.Prefix, value any) {
+func (pt *trie[T]) Insert(network netip.Prefix, value T) Trie[T] {
 	network = normalizePrefix(network)
-	pt.insert(network, emptyize(value))
+	return pt.insert(network, &value)
 }
 
 // Remove removes the entry identified by given network from trie.
-func (pt *Trie) Remove(network netip.Prefix) any {
+func (pt *trie[T]) Remove(network netip.Prefix) (T, bool) {
 	network = normalizePrefix(network)
 	return pt.remove(network)
 }
 
 // Find returns the value from the most specific network (largest prefix) containing the given address.
-func (pt *Trie) Find(ip netip.Addr) any {
+func (pt *trie[T]) Find(ip netip.Addr) (T, bool) {
 	ip = normalizeAddr(ip)
-	return unempty(pt.find(ip))
+	return pt.find(ip)
 }
 
 // FindLargest returns the value from the largest network (smallest prefix) containing the given address.
-func (pt *Trie) FindLargest(ip netip.Addr) any {
+func (pt *trie[T]) FindLargest(ip netip.Addr) (T, bool) {
 	ip = normalizeAddr(ip)
-	return unempty(pt.findLargest(ip))
+	return pt.findLargest(ip)
 }
 
 // Contains indicates whether the trie contains the given ip.
-func (pt *Trie) Contains(ip netip.Addr) bool {
+func (pt *trie[T]) Contains(ip netip.Addr) bool {
 	ip = normalizeAddr(ip)
-	return pt.findLargest(ip) != nil
+	_, contained := pt.findLargest(ip)
+	return contained
 }
 
 // ContainingNetworks returns the list of networks containing the given ip in ascending prefix order (largest network to
 // smallest).
 //
 // Note: Inserted addresses are normalized to IPv6, so the returned list will be IPv6 only.
-func (pt *Trie) ContainingNetworks(ip netip.Addr) []netip.Prefix {
+func (pt *trie[T]) ContainingNetworks(ip netip.Addr) []netip.Prefix {
 	ip = normalizeAddr(ip)
 	return pt.containingNetworks(ip)
 }
@@ -78,9 +92,19 @@ func (pt *Trie) ContainingNetworks(ip netip.Addr) []netip.Prefix {
 // CoveredNetworks returns the list of networks contained within the given network.
 //
 // Note: Inserted addresses are normalized to IPv6, so the returned list will be IPv6 only.
-func (pt *Trie) CoveredNetworks(network netip.Prefix) []netip.Prefix {
+func (pt *trie[T]) CoveredNetworks(network netip.Prefix) []netip.Prefix {
 	network = normalizePrefix(network)
 	return pt.coveredNetworks(network)
+}
+
+// GetParent returns the trie's parent (if any).
+func (pt *trie[T]) GetParent() Trie[T] {
+	return pt.parent
+}
+
+// GetNetwork returns the trie's network (if any).
+func (pt *trie[T]) GetNetwork() netip.Prefix {
+	return pt.network
 }
 
 // String returns string representation of trie.
@@ -89,7 +113,7 @@ func (pt *Trie) CoveredNetworks(network netip.Prefix) []netip.Prefix {
 // lack of a value.
 //
 // Note: Addresses are normalized to IPv6.
-func (pt *Trie) String() string {
+func (pt *trie[T]) String() string {
 	children := []string{}
 	padding := strings.Repeat("├ ", pt.level()+1)
 	for _, child := range pt.children {
@@ -102,7 +126,7 @@ func (pt *Trie) String() string {
 
 	var value string
 	if pt.value != nil {
-		value = fmt.Sprintf("%v", unempty(pt.value))
+		value = fmt.Sprintf("%v", *pt.value)
 		if len(value) > 32 {
 			value = value[0:31] + "…"
 		}
@@ -113,37 +137,40 @@ func (pt *Trie) String() string {
 		value, strings.Join(children, ""))
 }
 
-func (pt *Trie) find(ip netip.Addr) any {
+func (pt *trie[T]) find(ip netip.Addr) (T, bool) {
 	if !netContains(pt.network, ip) {
-		return nil
+		return zeroValueOfT[T](), false
 	}
 
 	if pt.network.Bits() == 128 {
-		return pt.value
+		return *pt.value, true
 	}
 
 	bit := pt.discriminatorBitFromIP(ip)
 	child := pt.children[bit]
 	if child != nil {
-		if v := child.find(ip); v != nil {
-			return v
+		if v, found := child.find(ip); found {
+			return v, found
 		}
 	}
 
-	return unempty(pt.value)
+	if pt.value != nil {
+		return *pt.value, true
+	}
+	return zeroValueOfT[T](), false
 }
 
-func (pt *Trie) findLargest(ip netip.Addr) any {
+func (pt *trie[T]) findLargest(ip netip.Addr) (T, bool) {
 	if !netContains(pt.network, ip) {
-		return nil
+		return zeroValueOfT[T](), false
 	}
 
 	if pt.value != nil {
-		return pt.value
+		return *pt.value, true
 	}
 
 	if pt.network.Bits() == 128 {
-		return nil
+		return zeroValueOfT[T](), false
 	}
 
 	bit := pt.discriminatorBitFromIP(ip)
@@ -152,10 +179,10 @@ func (pt *Trie) findLargest(ip netip.Addr) any {
 		return child.findLargest(ip)
 	}
 
-	return nil
+	return zeroValueOfT[T](), false
 }
 
-func (pt *Trie) containingNetworks(ip netip.Addr) []netip.Prefix {
+func (pt *trie[T]) containingNetworks(ip netip.Addr) []netip.Prefix {
 	var results []netip.Prefix
 	if !pt.network.Contains(ip) {
 		return results
@@ -181,7 +208,7 @@ func (pt *Trie) containingNetworks(ip netip.Addr) []netip.Prefix {
 	return results
 }
 
-func (pt *Trie) coveredNetworks(network netip.Prefix) []netip.Prefix {
+func (pt *trie[T]) coveredNetworks(network netip.Prefix) []netip.Prefix {
 	var results []netip.Prefix
 	if network.Bits() <= pt.network.Bits() && network.Contains(pt.network.Addr()) {
 		for entry := range pt.walkDepth() {
@@ -228,7 +255,7 @@ func netDivergence(net1 netip.Prefix, net2 netip.Prefix) netip.Prefix {
 	return pfx
 }
 
-func (pt *Trie) insert(network netip.Prefix, value any) *Trie {
+func (pt *trie[T]) insert(network netip.Prefix, value *T) *trie[T] {
 	if pt.network == network {
 		pt.value = value
 		return pt
@@ -248,7 +275,7 @@ func (pt *Trie) insert(network netip.Prefix, value any) *Trie {
 	// in the case that inserted network diverges on its path to existing child.
 	netdiv := netDivergence(existingChild.network, network)
 	if netdiv != existingChild.network {
-		pathPrefix := newSubTree(netdiv, nil)
+		pathPrefix := newSubTree[T](netdiv, nil)
 		pt.insertPrefix(bit, pathPrefix, existingChild)
 		// Update new child
 		existingChild = pathPrefix
@@ -256,12 +283,12 @@ func (pt *Trie) insert(network netip.Prefix, value any) *Trie {
 	return existingChild.insert(network, value)
 }
 
-func (pt *Trie) appendTrie(bit uint8, prefix *Trie) {
+func (pt *trie[T]) appendTrie(bit uint8, prefix *trie[T]) {
 	pt.children[bit] = prefix
 	prefix.parent = pt
 }
 
-func (pt *Trie) insertPrefix(bit uint8, pathPrefix, child *Trie) {
+func (pt *trie[T]) insertPrefix(bit uint8, pathPrefix, child *trie[T]) {
 	// Set parent/child relationship between current trie and inserted pathPrefix
 	pt.children[bit] = pathPrefix
 	pathPrefix.parent = pt
@@ -272,26 +299,26 @@ func (pt *Trie) insertPrefix(bit uint8, pathPrefix, child *Trie) {
 	child.parent = pathPrefix
 }
 
-func (pt *Trie) remove(network netip.Prefix) any {
+func (pt *trie[T]) remove(network netip.Prefix) (T, bool) {
 	if pt.value != nil && pt.network == network {
-		entry := pt.value
+		entry := *pt.value
 		pt.value = nil
 
 		pt.compressPathIfPossible()
-		return entry
+		return entry, true
 	}
 	if pt.network.Bits() == 128 {
-		return nil
+		return zeroValueOfT[T](), false
 	}
 	bit := pt.discriminatorBitFromIP(network.Addr())
 	child := pt.children[bit]
 	if child != nil {
 		return child.remove(network)
 	}
-	return nil
+	return zeroValueOfT[T](), false
 }
 
-func (pt *Trie) qualifiesForPathCompression() bool {
+func (pt *trie[T]) qualifiesForPathCompression() bool {
 	// Current prefix trie can be path compressed if it meets all following.
 	//		1. records no CIDR entry
 	//		2. has single or no child
@@ -299,14 +326,14 @@ func (pt *Trie) qualifiesForPathCompression() bool {
 	return pt.value == nil && pt.childrenCount() <= 1 && pt.parent != nil
 }
 
-func (pt *Trie) compressPathIfPossible() {
+func (pt *trie[T]) compressPathIfPossible() {
 	if !pt.qualifiesForPathCompression() {
 		// Does not qualify to be compressed
 		return
 	}
 
 	// Find lone child.
-	var loneChild *Trie
+	var loneChild *trie[T]
 	for _, child := range pt.children {
 		if child != nil {
 			loneChild = child
@@ -326,7 +353,7 @@ func (pt *Trie) compressPathIfPossible() {
 	parent.compressPathIfPossible()
 }
 
-func (pt *Trie) childrenCount() int {
+func (pt *trie[T]) childrenCount() int {
 	count := 0
 	for _, child := range pt.children {
 		if child != nil {
@@ -336,7 +363,7 @@ func (pt *Trie) childrenCount() int {
 	return count
 }
 
-func (pt *Trie) discriminatorBitFromIP(addr netip.Addr) uint8 {
+func (pt *trie[T]) discriminatorBitFromIP(addr netip.Addr) uint8 {
 	// This is a safe uint boxing of int since we should never attempt to get
 	// target bit at a negative position.
 	pos := pt.network.Bits()
@@ -347,7 +374,7 @@ func (pt *Trie) discriminatorBitFromIP(addr netip.Addr) uint8 {
 	return uint8(a128.lo >> (63 - (pos - 64)) & 1)
 }
 
-func (pt *Trie) level() int {
+func (pt *trie[T]) level() int {
 	if pt.parent == nil {
 		return 0
 	}
@@ -355,7 +382,7 @@ func (pt *Trie) level() int {
 }
 
 // walkDepth walks the trie in depth order
-func (pt *Trie) walkDepth() <-chan netip.Prefix {
+func (pt *trie[T]) walkDepth() <-chan netip.Prefix {
 	entries := make(chan netip.Prefix)
 	go func() {
 		if pt.value != nil {
@@ -376,89 +403,4 @@ func (pt *Trie) walkDepth() <-chan netip.Prefix {
 		close(entries)
 	}()
 	return entries
-}
-
-// TrieLoader can be used to improve the performance of bulk inserts to a Trie. It caches the node of the
-// last insert in the tree, using it as the starting point to start searching for the location of the next insert. This
-// is highly beneficial when the addresses are pre-sorted.
-type TrieLoader struct {
-	trie       *Trie
-	lastInsert *Trie
-}
-
-func NewTrieLoader(trie *Trie) *TrieLoader {
-	return &TrieLoader{
-		trie:       trie,
-		lastInsert: trie,
-	}
-}
-
-func (ptl *TrieLoader) Insert(pfx netip.Prefix, v any) {
-	pfx = normalizePrefix(pfx)
-
-	diff := addr128(ptl.lastInsert.network.Addr()).xor(addr128(pfx.Addr()))
-	var pos int
-	if diff.hi != 0 {
-		pos = bits.LeadingZeros64(diff.hi)
-	} else {
-		pos = bits.LeadingZeros64(diff.lo) + 64
-	}
-	if pos > pfx.Bits() {
-		pos = pfx.Bits()
-	}
-	if pos > ptl.lastInsert.network.Bits() {
-		pos = ptl.lastInsert.network.Bits()
-	}
-
-	parent := ptl.lastInsert
-	for parent.network.Bits() > pos {
-		parent = parent.parent
-	}
-	ptl.lastInsert = parent.insert(pfx, v)
-}
-
-func normalizeAddr(addr netip.Addr) netip.Addr {
-	if addr.Is4() {
-		return netip.AddrFrom16(addr.As16())
-	}
-	return addr
-}
-func normalizePrefix(pfx netip.Prefix) netip.Prefix {
-	if pfx.Addr().Is4() {
-		pfx = netip.PrefixFrom(netip.AddrFrom16(pfx.Addr().As16()), pfx.Bits()+96)
-	}
-	return pfx.Masked()
-}
-
-// A lot of the code uses nil value tests to determine whether a node is explicit or implicitly created. Therefore
-// inserted values cannot be nil, and so `empty` is a placeholder to represent nil.
-type emptyStruct struct{}
-
-var empty = emptyStruct{}
-
-func emptyize(v any) any {
-	if v == nil {
-		return empty
-	}
-	return v
-}
-func unempty(v any) any {
-	if v == empty {
-		return nil
-	}
-	return v
-}
-
-func addr128(addr netip.Addr) uint128 {
-	return *(*uint128)(unsafe.Pointer(&addr))
-}
-func init() {
-	// Accessing the underlying data of a `netip.Addr` relies upon the data being
-	// in a known format, which is not guaranteed to be stable. So this init()
-	// function is to detect if it ever changes.
-	ip := netip.AddrFrom16([16]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15})
-	i128 := addr128(ip)
-	if i128.hi != 0x0001020304050607 || i128.lo != 0x08090a0b0c0d0e0f {
-		panic("netip.Addr format mismatch")
-	}
 }

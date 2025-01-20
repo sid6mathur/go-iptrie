@@ -29,7 +29,7 @@ import (
 ```
 Create a new ranger implemented using Path-Compressed prefix trie.
 ```go
-ipt := iptrie.NewTrie()
+ipt := iptrie.NewTrie[any]()
 ```
 
 Inserts CIDR blocks.
@@ -71,8 +71,8 @@ ipt.ContainingNetworks(netip.MustParseAddr("10.1.0.0"))
 For insertion of a large number (millions) of addresses, it will likely be much faster to use TrieLoader.
 
 ```go
-ipt := iptrie.NewTrie()
-loader := iptrie.NewTrieLoader(ipt)
+ipt := iptrie.NewTrie[any]()
+loader := iptrie.NewTrieLoader[any](ipt)
 
 for network in []string{
     "10.0.0.0/8",

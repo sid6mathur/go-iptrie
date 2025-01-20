@@ -12,18 +12,23 @@ import (
 )
 
 func ExampleTrie() {
-	ipt := NewTrie()
+	ipt := NewTrie[any]()
 	ipt.Insert(netip.MustParsePrefix("10.0.0.0/8"), "foo")
 	ipt.Insert(netip.MustParsePrefix("10.1.0.0/24"), "bar")
 
-	fmt.Printf("10.2.0.1: %+v\n", ipt.Find(netip.MustParseAddr("10.2.0.1")))
-	fmt.Printf("10.1.0.1: %+v\n", ipt.Find(netip.MustParseAddr("10.1.0.1")))
-	fmt.Printf("11.0.0.1: %+v\n", ipt.Find(netip.MustParseAddr("11.0.0.1")))
+	value, found := ipt.Find(netip.MustParseAddr("10.2.0.1"))
+	fmt.Printf("10.2.0.1: %+v (%t)\n", value, found)
+
+	value, found = ipt.Find(netip.MustParseAddr("10.1.0.1"))
+	fmt.Printf("10.1.0.1: %+v (%t)\n", value, found)
+
+	value, found = ipt.Find(netip.MustParseAddr("11.0.0.1"))
+	fmt.Printf("11.0.0.1: %+v (%t)\n", value, found)
 
 	// Output:
-	// 10.2.0.1: foo
-	// 10.1.0.1: bar
-	// 11.0.0.1: <nil>
+	// 10.2.0.1: foo (true)
+	// 10.1.0.1: bar (true)
+	// 11.0.0.1: <nil> (false)
 }
 
 func TestTrieInsert(t *testing.T) {
@@ -76,13 +81,14 @@ func TestTrieInsert(t *testing.T) {
 	v := any(1)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			trie := NewTrie()
+			tr := NewTrie[any]()
 			for _, insert := range tc.inserts {
 				network := netip.MustParsePrefix(insert)
-				trie.Insert(network, v)
+				tr.Insert(network, v)
 			}
 
-			walk := trie.walkDepth()
+			assert.IsType(t, &trie[any]{}, tr)
+			walk := tr.(*trie[any]).walkDepth()
 			for _, network := range tc.expectedNetworksInDepthOrder {
 				expected := normalizePrefix(netip.MustParsePrefix(network))
 				actual := <-walk
@@ -99,7 +105,7 @@ func TestTrieInsert(t *testing.T) {
 
 func ExampleTrie_String() {
 	inserts := []string{"192.168.0.0/24", "192.168.1.0/24", "192.168.1.0/30"}
-	trie := NewTrie()
+	trie := NewTrie[string]()
 	for _, insert := range inserts {
 		network := netip.MustParsePrefix(insert)
 		trie.Insert(network, "net="+insert)
@@ -202,22 +208,25 @@ func TestTrieRemove(t *testing.T) {
 
 	for tci, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			trie := NewTrie()
+			tr := NewTrie[string]()
 			for _, insert := range tc.inserts {
 				network := netip.MustParsePrefix(insert)
-				trie.Insert(network, insert)
+				tr.Insert(network, insert)
 			}
 			for i, remove := range tc.removes {
 				network := netip.MustParsePrefix(remove)
-				removed := trie.Remove(network)
+				removed, wasRemoved := tr.Remove(network)
 				if str := tc.expectedRemoves[i]; str != "" {
 					assert.Equal(t, str, removed, "tc=%d", tci)
+					assert.True(t, wasRemoved)
 				} else {
-					assert.Nil(t, removed, "tc=%d", tci)
+					assert.Equal(t, zeroValueOfT[string](), removed, "tc=%d", tci)
+					assert.False(t, wasRemoved)
 				}
 			}
 
-			walk := trie.walkDepth()
+			assert.IsType(t, &trie[string]{}, tr)
+			walk := tr.(*trie[string]).walkDepth()
 			for _, network := range tc.expectedNetworksInDepthOrder {
 				expected := normalizePrefix(netip.MustParsePrefix(network))
 				actual := <-walk
@@ -229,13 +238,13 @@ func TestTrieRemove(t *testing.T) {
 				assert.Nil(t, network)
 			}
 
-			assert.Equal(t, tc.expectedTrieString, trie.String(), "tc=%d", tci)
+			assert.Equal(t, tc.expectedTrieString, tr.String(), "tc=%d", tci)
 		})
 	}
 }
 
 func TestTrieContains(t *testing.T) {
-	pt := NewTrie()
+	pt := NewTrie[any]()
 
 	assert.False(t, pt.Contains(netip.MustParseAddr("10.0.0.1")))
 
@@ -245,7 +254,7 @@ func TestTrieContains(t *testing.T) {
 }
 
 func TestTrieNilValue(t *testing.T) {
-	pt := NewTrie()
+	pt := NewTrie[any]()
 	pt.Insert(netip.MustParsePrefix("10.0.0.0/8"), nil)
 	pt.Insert(netip.MustParsePrefix("10.1.0.0/16"), nil)
 	pt.Remove(netip.MustParsePrefix("10.1.0.0/16"))
@@ -277,19 +286,20 @@ func TestFindFull128(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			trie := NewTrie()
+			tr := NewTrie[any]()
 			for _, insert := range tc.inserts {
 				network := netip.MustParsePrefix(insert)
-				trie.Insert(network, insert)
+				tr.Insert(network, insert)
 			}
 			expectedEntries := []netip.Prefix{}
 			for _, network := range tc.networks {
 				expected := normalizePrefix(netip.MustParsePrefix(network))
 				expectedEntries = append(expectedEntries, expected)
 			}
-			contains := trie.Find(tc.ip)
+			contains, found := tr.Find(tc.ip)
 			assert.NotNil(t, contains)
-			networks := trie.ContainingNetworks(tc.ip)
+			assert.True(t, found)
+			networks := tr.ContainingNetworks(tc.ip)
 			assert.Equal(t, expectedEntries, networks)
 		})
 	}
@@ -325,32 +335,36 @@ func TestTrieFind(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			trie := NewTrie()
+			tr := NewTrie[any]()
 			v := any(1)
 			for _, insert := range tc.inserts {
 				network := netip.MustParsePrefix(insert)
-				trie.Insert(network, v)
+				tr.Insert(network, v)
 			}
 			for _, expectedIPRange := range tc.expectedIPs {
 				var contains any
+				var found bool
 				start := expectedIPRange.start
 				for ; expectedIPRange.end != start; start = start.Next() {
-					contains = trie.Find(start)
+					contains, found = tr.Find(start)
 					assert.NotNil(t, contains)
+					assert.True(t, found)
 				}
 
 				// Check out of bounds ips on both ends
-				contains = trie.Find(expectedIPRange.start.Prev())
-				assert.Nil(t, contains)
-				contains = trie.Find(expectedIPRange.end.Next())
-				assert.Nil(t, contains)
+				contains, found = tr.Find(expectedIPRange.start.Prev())
+				assert.Equal(t, zeroValueOfT[any](), contains)
+				assert.False(t, found)
+				contains, found = tr.Find(expectedIPRange.end.Next())
+				assert.Equal(t, zeroValueOfT[any](), contains)
+				assert.False(t, found)
 			}
 		})
 	}
 }
 
 func TestTrieFindOverlap(t *testing.T) {
-	trie := NewTrie()
+	trie := NewTrie[any]()
 
 	v1 := any(1)
 	trie.Insert(netip.MustParsePrefix("192.168.0.0/24"), v1)
@@ -358,8 +372,9 @@ func TestTrieFindOverlap(t *testing.T) {
 	v2 := any(2)
 	trie.Insert(netip.MustParsePrefix("192.168.0.0/25"), v2)
 
-	v := trie.Find(netip.MustParseAddr("192.168.0.1"))
+	v, found := trie.Find(netip.MustParseAddr("192.168.0.1"))
 	assert.Equal(t, v2, v)
+	assert.True(t, found)
 }
 
 func TestTrieContainingNetworks(t *testing.T) {
@@ -384,7 +399,7 @@ func TestTrieContainingNetworks(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			trie := NewTrie()
+			trie := NewTrie[any]()
 			v := any(1)
 			for _, insert := range tc.inserts {
 				network := netip.MustParsePrefix(insert)
@@ -467,7 +482,7 @@ var coveredNetworkTests = []coveredNetworkTest{
 func TestTrieCoveredNetworks(t *testing.T) {
 	for _, tc := range coveredNetworkTests {
 		t.Run(tc.name, func(t *testing.T) {
-			trie := NewTrie()
+			trie := NewTrie[any]()
 			v := any(1)
 			for _, insert := range tc.inserts {
 				network := netip.MustParsePrefix(insert)
@@ -496,7 +511,7 @@ func TestTrieMemUsage(t *testing.T) {
 	// by threshold, picking 1% as sane number for detecting memory leak.
 	thresh := 1.01
 
-	trie := NewTrie()
+	trie := NewTrie[any]()
 
 	var baseLineHeap, totalHeapAllocOverRuns uint64
 	for i := 0; i < runs; i++ {
@@ -556,7 +571,7 @@ func GetHeapAllocation() uint64 {
 }
 
 func ExampleTrieLoader() {
-	pt := NewTrie()
+	pt := NewTrie[any]()
 	ptl := NewTrieLoader(pt)
 
 	networks := []string{

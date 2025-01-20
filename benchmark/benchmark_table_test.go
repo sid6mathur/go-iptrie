@@ -90,7 +90,7 @@ func parseToTable(buf *bytes.Buffer) string {
 
 	pkgNames := []string{}
 	for _, times := range testTimes {
-		for k, _ := range times {
+		for k := range times {
 			pkgNames = append(pkgNames, k)
 		}
 		break
@@ -105,7 +105,7 @@ func parseToTable(buf *bytes.Buffer) string {
 	tbl.SetAutoFormatHeaders(false)
 	tbl.SetHeader(append([]string{"*(OPs/Sec)*"}, pkgNames...))
 	var testNames []string
-	for testName, _ := range testTimes {
+	for testName := range testTimes {
 		testNames = append(testNames, testName)
 	}
 	sort.Strings(testNames)
